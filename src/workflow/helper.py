@@ -1,5 +1,6 @@
 from src.config.setup import GOOGLE_ICON_PATH
 from src.utils.template import TemplateLoader
+# from src.agents.react_simple import run_react_agent
 from src.agents.react import run_react_agent
 from src.config.logging import logger
 from typing import Optional
@@ -427,7 +428,7 @@ def render_sidebar() -> int:
             "Max Iterations",
             min_value=1,
             max_value=30,
-            value=10,
+            value=8,
             step=1,
             help="Set how many reasoning steps the agent can perform."
         )

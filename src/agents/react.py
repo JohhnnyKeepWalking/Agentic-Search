@@ -50,9 +50,11 @@ from typing import Any
 from enum import Enum
 from enum import auto 
 import json
+import os
+import re
 
 Observation = Union[str, Exception]
-PROMPT_TEMPLATE_PATH = "./templates/react.txt"
+PROMPT_TEMPLATE_PATH = "./templates/react_simple.txt"
 
 class Name(Enum):
     WIKI_SEARCH = auto()
@@ -134,12 +136,24 @@ class Tool:
             elif isinstance(query, dict):
                 # Ensure the required arguments are present in the dictionary
                 required_args = self.func.__code__.co_varnames[:self.func.__code__.co_argcount]
-                missing_args = [arg for arg in required_args if arg not in query]
-                if missing_args:
-                    raise ValueError(f"Missing required arguments for tool {self.name}: {missing_args}")
+                logger.info(f"Required arguments for {self.name}: {required_args}")
+                logger.info(f"Provided query keys: {list(query.keys())}")
+                if self.name == Name.GEMINI_MULTIMODAL:
+                    result = self.func(q=query)
+                else:
+                    if "q" in required_args and "text" in query:
+                        q = query["text"]
+                        result = self.func(q=q)
+                    elif "query" in required_args and "text" in query:
+                        q = query["text"]
+                        result = self.func(query=q)
+                    else:
+                        missing_args = [arg for arg in required_args if arg not in query]
+                        if missing_args:
+                            raise ValueError(f"Missing required arguments for tool {self.name}: {missing_args}")
 
-                # Call the function with unpacked arguments
-                result = self.func(**query)
+                        # Call the function with unpacked arguments
+                        result = self.func(**query)
             elif isinstance(query, str):
                 # Pass string input directly
                 result = self.func(query)
@@ -353,12 +367,64 @@ class Agent:
             history.append(f"Last action result: {json.dumps(self.last_action_result, indent=2)}")
         return "\n".join(history)
 
-    def ask_gemini(self, prompt: str) -> dict:
+    def parse_model_response(self, raw_response: str) -> dict:
+        """
+        Parse model response, handling cases where it returns plain text instead of JSON.
+        
+        Args:
+            raw_response (str): The raw response string from the model.
+            
+        Returns:
+            dict: Parsed JSON or wrapped plain text response.
+        """
+        
+        cleaned = raw_response.strip()
+        
+        # Remove markdown code block markers if present
+        if cleaned.startswith('```'):
+            # Extract content from code block
+            match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', cleaned)
+            if match:
+                cleaned = match.group(1).strip()
+            else:
+                # Remove leading ``` and trailing ``` if no proper match
+                cleaned = cleaned.strip('`').strip()
+        
+        # Remove 'json' prefix if present (e.g., "json{...}")
+        if cleaned.lower().startswith('json'):
+            cleaned = cleaned[4:].strip()
+        
+        # Try direct JSON parse
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            logger.warning(f"Direct JSON parsing failed for response: {cleaned[:500]}...")  # Log truncated response
+            pass
+        
+        # Try to find JSON object anywhere in response
+        json_match = re.search(r'\{[\s\S]*\}', cleaned)
+        if json_match:
+            try:
+                return json.loads(json_match.group(0))
+            except json.JSONDecodeError:
+                pass
+        
+        # Fallback: Model gave plain text, wrap it as an answer
+        logger.warning(f"Model responded with plain text, wrapping as answer")
+        return {"thought": cleaned, "action": None}
+
+
+    # ============================================================================
+    # CHANGE 2: Replace the existing ask_gemini method with this version
+    # ============================================================================
+
+    def ask_gemini(self, prompt: str, max_retries: int = 1) -> dict:
         """
         Generate a response using the language model.
 
         Args:
             prompt (str): The input prompt for the model.
+            max_retries (int): Number of retries if JSON parsing fails.
 
         Returns:
             dict: The response from the model, parsed as JSON.
@@ -372,25 +438,24 @@ class Agent:
                 response = self.tools[Name.GEMINI_MULTIMODAL].use(multimodal_input)
             else:
                 response = generate_content(self.client, self.model, prompt)
-                response = str(response.text) if response else {"error": "No response from Gemini"}
+                response = str(response.text) if response else ""
+                logger.info(f"Raw response from Gemini: {response}")
+            
+            # Handle empty response
+            if not response or not response.strip():
+                logger.error("Empty response from model")
+                return {"error": "Empty response from model"}
             
             # Log raw response for debugging
-            cleaned_response = response.strip().strip('`').strip()
-            logger.info(f"Raw response before JSON parsing: {cleaned_response}")
+            logger.info(f"Raw response before parsing: {response[:500]}...")  # Truncate for logging
             
-            # Handle potential prefixes
-            if cleaned_response.startswith('json'):
-                cleaned_response = cleaned_response[4:].strip()
+            # CHANGE: Use the new robust parser
+            return self.parse_model_response(response)
             
-            # Validate and parse JSON
-            try:
-                return json.loads(cleaned_response)
-            except json.JSONDecodeError as jde:
-                logger.error(f"JSON decode error: {jde} | Response: {cleaned_response}")
-                return {"error": f"Invalid JSON response: {str(jde)}"}
         except Exception as e:
             logger.error(f"Error in ask_gemini: {e}")
             return {"error": str(e)}
+
 
 
     def think(self):
@@ -419,6 +484,10 @@ class Agent:
         self.trace("assistant", f"Thought: {response}")
         return response
 
+# ============================================================================
+# FIXED decide_and_act - Check for answer FIRST
+# ============================================================================
+
     def decide_and_act(self, response: dict):
         """
         Interpret the model's response and execute the appropriate action.
@@ -430,14 +499,53 @@ class Agent:
             Optional[Any]: The final answer, if available.
         """
         try:
+            # Handle error responses from ask_gemini
+            if "error" in response:
+                logger.error(f"Error in response: {response['error']}")
+                self.trace("assistant", f"I encountered an error: {response['error']}. Let me try again.")
+                return None
+            
+            # =====================================================================
+            # FIX: Check for answer FIRST before checking action
+            # This handles cases where model returns {"action": null, "answer": "..."}
+            # =====================================================================
+            if "answer" in response:
+                final = response.get("answer")
+                # Make sure answer is not None or empty
+                if final is not None and str(final).strip():
+                    self.trace("assistant", f"Final Answer: {final}")
+                    return final
+                # If answer exists but is empty, fall through to action handling
+            
             if "action" in response:
                 action = response["action"]
-                name_str = action["name"].upper()
+                
+                # Handle null/None action
+                if action is None:
+                    logger.info("Action is null, continuing to next iteration...")
+                    self.trace("assistant", "Thinking about next steps...")
+                    return None
+                
+                # Safely get action name
+                action_name = action.get("name") if isinstance(action, dict) else None
+                if action_name is None:
+                    logger.warning("Action name is missing, continuing...")
+                    self.trace("assistant", "Reconsidering approach...")
+                    return None
+                    
+                name_str = action_name.upper()
 
                 if name_str == "NONE":
                     return None
 
-                tool_name = Name[name_str]
+                # Handle unknown tool names gracefully
+                try:
+                    tool_name = Name[name_str]
+                except KeyError:
+                    logger.error(f"Unknown tool name: {name_str}")
+                    self.trace("assistant", f"Unknown tool '{name_str}', let me try a different approach.")
+                    return None
+                
                 self.trace("assistant", f"Action: Using {tool_name} tool")
 
                 if tool_name == Name.GEMINI_MULTIMODAL:
@@ -466,19 +574,17 @@ class Agent:
                 self.trace("system", observation)
                 return None
 
-            elif "answer" in response:
-                final = response["answer"]
-                self.trace("assistant", f"Final Answer: {final}")
-                return final
-
             else:
-                raise ValueError("Unrecognized JSON structure")
+                # No action and no valid answer
+                logger.warning(f"Unrecognized JSON structure: {response}")
+                self.trace("assistant", "Let me reconsider...")
+                return None
 
         except Exception as e:
             logger.error(f"Error in decide_and_act: {e}")
             self.trace("assistant", f"I encountered an error: {str(e)}. Let me try again.")
             return None
-
+    
     def run_iter(self, query: Dict[str, Any]):
         """
         Run a single iteration of the agent's execution loop.
@@ -493,7 +599,7 @@ class Agent:
 
         if isinstance(query, dict):
             self.query = query.get('text', '')
-            self.image_path = query.get('image_path')
+            self.image_path = os.path.abspath(query.get('image_path')) if query.get('image_path') else None
         else:
             self.query = str(query)
             self.image_path = None
@@ -563,40 +669,40 @@ def build_agent(max_iterations: int) -> Agent:
     agent = Agent(model=MODEL, max_iterations=max_iterations)
 
     # Register tools for the agent
-    agent.register_tool(Name.WIKI_SEARCH, get_wiki_search_results)
+    # agent.register_tool(Name.WIKI_SEARCH, get_wiki_search_results)
     agent.register_tool(Name.GOOGLE_SEARCH, get_google_search_results)
-    agent.register_tool(Name.CAT_FACT, get_cat_fact)
+    # agent.register_tool(Name.CAT_FACT, get_cat_fact)
     agent.register_tool(Name.WALMART_SEARCH, get_walmart_basic_search)
-    agent.register_tool(Name.MULTIPLE_CAT_FACTS, get_multiple_cat_facts)
-    agent.register_tool(Name.CAT_BREEDS, get_cat_breeds)
-    agent.register_tool(Name.DOG_IMAGE, get_random_dog_image)
-    agent.register_tool(Name.MULTIPLE_DOG_IMAGES, get_multiple_dog_images)
-    agent.register_tool(Name.DOG_BREED_IMAGE, get_random_dog_breed_image)
-    agent.register_tool(Name.RANDOM_JOKE, get_random_joke)
-    agent.register_tool(Name.TEN_RANDOM_JOKES, get_ten_random_jokes)
-    agent.register_tool(Name.RANDOM_JOKE_BY_TYPE, get_random_joke_by_type)
-    agent.register_tool(Name.ZIP_INFO, get_zip_info)
-    agent.register_tool(Name.PUBLIC_IP, get_public_ip)
-    agent.register_tool(Name.CURRENT_LOCATION, get_public_ip_with_location)
-    agent.register_tool(Name.ISS_LOCATION, get_iss_location)
-    agent.register_tool(Name.LYRICS, get_lyrics)
-    agent.register_tool(Name.RANDOM_FOX_IMAGE, get_random_fox_image)
-    agent.register_tool(Name.TRIVIA_QUESTIONS, get_trivia_questions)
-    agent.register_tool(Name.EXCHANGE_RATES, get_exchange_rates)
-    agent.register_tool(Name.GOOGLE_IMAGE_SEARCH, get_google_image_search_results)
-    agent.register_tool(Name.GOOGLE_NEWS_SEARCH, get_google_news_search)
-    agent.register_tool(Name.GOOGLE_MAPS_SEARCH, get_google_maps_search)
-    agent.register_tool(Name.GOOGLE_MAPS_PLACE, get_google_maps_place)
-    agent.register_tool(Name.GOOGLE_JOBS_SEARCH, get_google_jobs_search)
-    agent.register_tool(Name.GOOGLE_SHOPPING_SEARCH, get_google_shopping_search)
-    agent.register_tool(Name.YOUTUBE_SEARCH, get_youtube_basic_search)
-    agent.register_tool(Name.GOOGLE_PLAY_SEARCH, get_google_play_query_search)
-    agent.register_tool(Name.GOOGLE_LOCAL_SEARCH, get_google_local_basic_search)
-    agent.register_tool(Name.GOOGLE_VIDEOS_SEARCH, get_google_videos_basic_search)
-    agent.register_tool(Name.GOOGLE_EVENTS_SEARCH, get_google_events_basic_search)
-    agent.register_tool(Name.GOOGLE_FINANCE_SEARCH, get_google_finance_basic_search)
-    agent.register_tool(Name.GOOGLE_FINANCE_CURRENCY_EXCHANGE, get_google_finance_currency_exchange)
-    agent.register_tool(Name.GOOGLE_LOCATION_SPECIFIC_SEARCH, get_google_location_specific_search)
+    # agent.register_tool(Name.MULTIPLE_CAT_FACTS, get_multiple_cat_facts)
+    # agent.register_tool(Name.CAT_BREEDS, get_cat_breeds)
+    # agent.register_tool(Name.DOG_IMAGE, get_random_dog_image)
+    # agent.register_tool(Name.MULTIPLE_DOG_IMAGES, get_multiple_dog_images)
+    # agent.register_tool(Name.DOG_BREED_IMAGE, get_random_dog_breed_image)
+    # agent.register_tool(Name.RANDOM_JOKE, get_random_joke)
+    # agent.register_tool(Name.TEN_RANDOM_JOKES, get_ten_random_jokes)
+    # agent.register_tool(Name.RANDOM_JOKE_BY_TYPE, get_random_joke_by_type)
+    # agent.register_tool(Name.ZIP_INFO, get_zip_info)
+    # agent.register_tool(Name.PUBLIC_IP, get_public_ip)
+    # agent.register_tool(Name.CURRENT_LOCATION, get_public_ip_with_location)
+    # agent.register_tool(Name.ISS_LOCATION, get_iss_location)
+    # agent.register_tool(Name.LYRICS, get_lyrics)
+    # agent.register_tool(Name.RANDOM_FOX_IMAGE, get_random_fox_image)
+    # agent.register_tool(Name.TRIVIA_QUESTIONS, get_trivia_questions)
+    # agent.register_tool(Name.EXCHANGE_RATES, get_exchange_rates)
+    # agent.register_tool(Name.GOOGLE_IMAGE_SEARCH, get_google_image_search_results)
+    # agent.register_tool(Name.GOOGLE_NEWS_SEARCH, get_google_news_search)
+    # agent.register_tool(Name.GOOGLE_MAPS_SEARCH, get_google_maps_search)
+    # agent.register_tool(Name.GOOGLE_MAPS_PLACE, get_google_maps_place)
+    # agent.register_tool(Name.GOOGLE_JOBS_SEARCH, get_google_jobs_search)
+    # agent.register_tool(Name.GOOGLE_SHOPPING_SEARCH, get_google_shopping_search)
+    # agent.register_tool(Name.YOUTUBE_SEARCH, get_youtube_basic_search)
+    # agent.register_tool(Name.GOOGLE_PLAY_SEARCH, get_google_play_query_search)
+    # agent.register_tool(Name.GOOGLE_LOCAL_SEARCH, get_google_local_basic_search)
+    # agent.register_tool(Name.GOOGLE_VIDEOS_SEARCH, get_google_videos_basic_search)
+    # agent.register_tool(Name.GOOGLE_EVENTS_SEARCH, get_google_events_basic_search)
+    # agent.register_tool(Name.GOOGLE_FINANCE_SEARCH, get_google_finance_basic_search)
+    # agent.register_tool(Name.GOOGLE_FINANCE_CURRENCY_EXCHANGE, get_google_finance_currency_exchange)
+    # agent.register_tool(Name.GOOGLE_LOCATION_SPECIFIC_SEARCH, get_google_location_specific_search)
     agent.register_tool(Name.GEMINI_MULTIMODAL, get_multimodal_reasoning)
 
     return agent
@@ -620,7 +726,7 @@ if __name__ == "__main__":
     complex_query = {
         "text": "Tell me about the history of the Eiffel Tower and suggest some nearby attractions to visit.",
     }
-    max_iterations = 10
+    max_iterations = 5
 
     for iteration_data in run_react_agent(complex_query, max_iterations):
         logger.info(f"Iteration {iteration_data['iteration']}:")

@@ -1,0 +1,39 @@
+
+find similar products on walmart
+
+
+
+I'm looking for some options for gaming laptop on walmart that can run modern AAA games like Cyberpunk or Elden Ring smoothly, preferably with an RTX graphics card, at least 16GB RAM, and not too bulky
+
+
+
+
+
+
+
+Use cases: 
+
+1. Natural language search, query reformulation, result filtering
+2. Personalized search results by passing use history or preference into prompt
+3. Image search
+
+
+
+
+Architecture:
+
+User -> 
+Chat interface ->
+Conversation manager -> 
+Prompt construction + policy -> 
+Tools (memory, search, browsing, files) -> 
+Model inference ->
+Safety filter + formatting ->
+Response (end)
+
+
+
+Challenge: 
+1. High latency / Long prompt
+2. Result accuracy
+3. Good performance across multiple use cases

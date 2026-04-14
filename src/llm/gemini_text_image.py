@@ -20,8 +20,12 @@ def generate_multimodal_content(prompt: str, image_path: str) -> str:
         image = Image.open(Path(image_path))
         
         response = client.models.generate_content(
-            model="gemini-2.0-flash-exp",
-            contents=[image, prompt]
+            model="gemini-3-flash-preview",
+            contents=[image, prompt],
+            config={
+                "temperature": 0.0,
+                "top_k": 1,
+            }
         )
         return response.text
         

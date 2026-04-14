@@ -27,7 +27,8 @@ def generate_content(client: genai.Client, model_id: str, prompt: str) -> str:
         try:
             logger.info(f"Generating content using model: {model_id}, Attempt: {attempt + 1}")
             start_time = time.time()  # Start the timer
-            response = client.models.generate_content(model=model_id, contents=prompt)
+            response = client.models.generate_content(model=model_id, contents=prompt, config={
+                "temperature": 0.0, "top_k": 1})
             end_time = time.time()  # End the timer
             elapsed_time = end_time - start_time  # Calculate elapsed time
 
@@ -64,7 +65,7 @@ if __name__ == "__main__":
     try:
         gemini_client: genai.Client = initialize_genai_client()
 
-        MODEL_ID: str = "gemini-2.0-flash-exp"
+        MODEL_ID: str = "gemini-3-flash-preview"
         prompt: str = "What's the largest planet in our solar system?"
 
         # Generate content
